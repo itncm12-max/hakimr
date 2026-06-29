@@ -108,6 +108,99 @@ export default function App() {
     return headers;
   };
 
+  // Client-side fallback calling function when the backend is unreachable or doesn't support the action (like on Vercel)
+  const callGeminiDirectly = async (
+    params: {
+      contents: any[];
+      systemInstruction: string;
+      responseMimeType?: string;
+    }
+  ) => {
+    const savedKey = localStorage.getItem("custom_gemini_api_key");
+    if (!savedKey) {
+      throw new Error("Aucune clé d'API Google Gemini configurée. Veuillez saisir une clé d'API valide.");
+    }
+
+    // Format the contents list into the standard Gemini API structure
+    const formattedContents = params.contents.map((c) => {
+      if (c.inlineData) {
+        return {
+          parts: [
+            {
+              inlineData: {
+                mimeType: c.inlineData.mimeType,
+                data: c.inlineData.data,
+              },
+            },
+          ],
+        };
+      }
+      if (c.text) {
+        return {
+          role: "user",
+          parts: [{ text: c.text }],
+        };
+      }
+      if (typeof c === "string") {
+        return {
+          role: "user",
+          parts: [{ text: c }],
+        };
+      }
+      return c;
+    });
+
+    const body: any = {
+      contents: formattedContents,
+    };
+
+    if (params.systemInstruction || params.responseMimeType) {
+      body.generationConfig = {};
+      if (params.responseMimeType) {
+        body.generationConfig.responseMimeType = params.responseMimeType;
+      }
+      if (params.systemInstruction) {
+        body.systemInstruction = {
+          parts: [{ text: params.systemInstruction }],
+        };
+      }
+    }
+
+    // Try multiple models starting from gemini-2.5-flash down to gemini-1.5-flash
+    const modelsToTry = ["gemini-2.5-flash", "gemini-1.5-flash"];
+    let lastError = null;
+
+    for (const model of modelsToTry) {
+      try {
+        const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${savedKey}`;
+        const response = await fetch(url, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify(body),
+        });
+
+        if (!response.ok) {
+          const errText = await response.text();
+          throw new Error(`Model ${model} failed: ${errText || response.statusText}`);
+        }
+
+        const resData = await response.json();
+        const text = resData.candidates?.[0]?.content?.parts?.[0]?.text;
+        if (!text) {
+          throw new Error(`Empty content returned from ${model}`);
+        }
+        return text;
+      } catch (err: any) {
+        console.warn(`Direct model ${model} failed, trying next fallback...`, err);
+        lastError = err;
+      }
+    }
+
+    throw lastError || new Error("Failed to reach Gemini API with any models.");
+  };
+
   const handleTestApiKey = async (keyToTest: string) => {
     if (!keyToTest) {
       setKeyTestStatus("error");
@@ -117,25 +210,52 @@ export default function App() {
     setKeyTestStatus("testing");
     setKeyTestError("");
     try {
+      // 1. Try to test via server endpoint first
       const headers: Record<string, string> = {};
       if (keyToTest) {
         headers["x-gemini-api-key"] = keyToTest;
       }
-      const response = await fetch("/api/health", { headers });
-      const data = await response.json();
-      if (data.apiKeyConfigured) {
+      try {
+        const response = await fetch("/api/health", { headers });
+        if (response.ok) {
+          const data = await response.json();
+          if (data.apiKeyConfigured) {
+            setKeyTestStatus("success");
+            setIsServerHealthy(true);
+            // Save to local storage
+            localStorage.setItem("custom_gemini_api_key", keyToTest);
+            setCustomApiKey(keyToTest);
+            return;
+          }
+        }
+      } catch (serverErr) {
+        console.warn("Server health check failed, testing key directly on client side...", serverErr);
+      }
+
+      // 2. Direct client-side validation fallback
+      const directUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${keyToTest}`;
+      const directRes = await fetch(directUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: "Hello" }] }]
+        })
+      });
+
+      if (directRes.ok) {
         setKeyTestStatus("success");
         setIsServerHealthy(true);
-        // Save to local storage
         localStorage.setItem("custom_gemini_api_key", keyToTest);
         setCustomApiKey(keyToTest);
       } else {
+        const errorData = await directRes.json().catch(() => ({}));
+        const errMsg = errorData.error?.message || "La clé d'API a été rejetée par Google Gemini.";
         setKeyTestStatus("error");
-        setKeyTestError(data.message || "La clé d'API a été rejetée par Google Gemini.");
+        setKeyTestError(errMsg);
       }
     } catch (err: any) {
       setKeyTestStatus("error");
-      setKeyTestError("Impossible de se connecter au serveur de test.");
+      setKeyTestError("Impossible de se connecter au serveur de test ou à l'API Google Gemini.");
     }
   };
 
@@ -606,20 +726,150 @@ export default function App() {
         requestBody.manualTranscript = transcriptToUse;
       }
 
-      const response = await fetch("/api/summarize", {
-        method: "POST",
-        headers: getHeaders(),
-        body: JSON.stringify(requestBody),
-      });
+      let summaryResult: MeetingSummary;
 
-      clearInterval(stepTimer);
+      try {
+        const response = await fetch("/api/summarize", {
+          method: "POST",
+          headers: getHeaders(),
+          body: JSON.stringify(requestBody),
+        });
 
-      if (!response.ok) {
-        const errData = await response.json();
-        throw new Error(errData.error || "Le serveur a renvoyé un code de statut invalide.");
+        clearInterval(stepTimer);
+
+        if (!response.ok) {
+          const errData = await response.json().catch(() => ({}));
+          throw new Error(errData.error || "Le serveur a renvoyé un code de statut invalide.");
+        }
+
+        summaryResult = await response.json();
+      } catch (err: any) {
+        clearInterval(stepTimer);
+        // Fallback to client-side direct call if custom key exists
+        const savedKey = localStorage.getItem("custom_gemini_api_key");
+        if (savedKey) {
+          console.log("Server summarization failed or unreachable, trying direct client-side fallback...", err);
+          setLoadingStep("Appel direct de l'API Google Gemini depuis votre navigateur...");
+
+          let contents: any[] = [];
+          let promptText = "";
+
+          if (activeTab === "record" && isSimulatedFlag) {
+            const simulatedTranscript = `Yassine: Salam l'équipe, wach rakoum ready pour notre daily standup? Lyoum lezemna darori nshofo la migration de la base de données l'cloud Run, et fin wsalna m3a l'API dial stripe.
+Meriem: Salam Yassine, oui ready. Pour Stripe, dert l'intégration de la v3, l-front-end kheddam mzyan. Mazal ghir ndir la validation f backend context bach ndezzo les webhooks l-secure endpoints. On aura besoin de tester ça sur sandbox lyoum l'3shiya.
+Amine: Salam, ana nqder n-handle-ha (n-géri-ha). Ghadi ncreyi les secrets f Google Secret Manager tma fin ghadi nkhabiw la clé privée Stripe et la config du serveur. Bach hka kolchi hani f secruity aspect. Concernant la migration de Postgres pour le Cloud SQL, rani bdit la réplication des tables hier soir, tout s'est bien passé. Mazal ghir chi index khasshom chwiya dial optimisation l'parce que l'query latency hbat chwiya m3a les jointures s3ab.
+Yassine: Ya3tik esaha Amine. Hada point crucial pour la performance de la prod. Chhal l'waqt lazemna pour finir l'indexation?
+Amine: Nqder nkemmelha d'ici ghodwa sba7 m3a 10h. Safi, ghir tkon ready, n-partagi l-rapport de test f slack.
+Yassine: Super! Khlas, Meriem tkemmel sandbox tests f 16h. Amine y-optimize les index de Postgres d'ici ghodwa m3a 10h. Netlaqaw sba7 pour valider l-build complet.`;
+
+            promptText = `
+              Analyze this simulated audio recording of an Algerian startup technical sync.
+              The speakers are code-switching between Algerian Darija (الدارجة الجزائرية) and French.
+              
+              Transcript:
+              """
+              ${simulatedTranscript}
+              """
+
+              Perform the following:
+              1. Keep or lightly polish the full transcribed conversation in "fullTranscript".
+              2. Create a professional, highly structured summary and analysis of this meeting.
+
+              Generate the output strictly following the JSON format schema below:
+              - "title": A suitable summary name for the meeting in ${outputLanguage}.
+              - "languagesFound": ["Darija", "French"] because this is conversational Algerian Darija and French.
+              - "overallSummary": Written in ${outputLanguage}.
+              - "keyDecisions": List of key decisions made, written in ${outputLanguage}.
+              - "discussionPoints": Array of objects with "topic" and "summary" fields in ${outputLanguage}.
+              - "actionItems": Array of objects with "task", "owner", and "priority" ("High" | "Medium" | "Low") in ${outputLanguage}.
+              - "fullTranscript": The original transcribed dialog text above.
+
+              Context notes provided by user (if any): "${notesToUse || 'None'}"
+            `;
+          } else if ((activeTab === "record" || activeTab === "file") && base64ToUse) {
+            let cleanMimeType = mimeToUse ? mimeToUse.split(";")[0].trim().toLowerCase() : "audio/webm";
+            if (cleanMimeType.includes("webm")) {
+              cleanMimeType = "audio/webm";
+            } else if (cleanMimeType.includes("ogg")) {
+              cleanMimeType = "audio/ogg";
+            } else if (cleanMimeType.includes("wav") || cleanMimeType.includes("x-wav")) {
+              cleanMimeType = "audio/wav";
+            } else if (cleanMimeType.includes("mp3") || cleanMimeType.includes("mpeg")) {
+              cleanMimeType = "audio/mp3";
+            } else if (cleanMimeType.includes("m4a") || cleanMimeType.includes("mp4") || cleanMimeType.includes("aac")) {
+              cleanMimeType = "audio/mp4";
+            }
+
+            contents.push({
+              inlineData: {
+                mimeType: cleanMimeType,
+                data: base64ToUse,
+              },
+            });
+
+            promptText = `
+              Analyze the attached audio meeting recording. 
+              The languages spoken in this meeting could include French, Arabic, Algerian Darija (الدارجة الجزائرية), English, or a mix of these (code-switching).
+              
+              Perform two primary tasks:
+              1. Transcribe the spoken text in the audio with high fidelity, translating any Darija/Arabic slang or phrases accurately but keeping the transcription mostly as spoken.
+              2. Create a professional, highly structured summary and analysis of this meeting.
+
+              Generate the output strictly following the JSON format schema below:
+              - The "title" should be a suitable summary name for the meeting in ${outputLanguage}.
+              - "languagesFound" must be list of languages detected in the audio (e.g. ["Darija", "French", "English", "Arabic"]).
+              - "overallSummary" of the meeting, written in ${outputLanguage}.
+              - "keyDecisions" list of key decisions made, written in ${outputLanguage}.
+              - "discussionPoints" array of objects with "topic" and "summary" fields in ${outputLanguage}.
+              - "actionItems" array of objects with "task", "owner", and "priority" ("High" | "Medium" | "Low") in ${outputLanguage}.
+              - "fullTranscript" representing the computed transcription or a clean reconstruct of what was said.
+
+              Context notes provided by user (if any): "${notesToUse || 'None'}"
+            `;
+          } else if (transcriptToUse) {
+            promptText = `
+              Analyze the following meeting transcript text. 
+              The transcript might be in French, Arabic, Algerian Darija, English, or mixed.
+              
+              Transcript:
+              """
+              ${transcriptToUse}
+              """
+
+              Context notes provided by user (if any): "${notesToUse || 'None'}"
+
+              Analyze this text and generate a professional, highly structured summary and analysis.
+              Generate the output strictly following the JSON format schema below:
+              - The "title" should be a suitable summary name for the meeting in ${outputLanguage}.
+              - "languagesFound" must be list of languages detected (e.g. ["Darija", "French", "English", "Arabic"]).
+              - "overallSummary" of the meeting, written in ${outputLanguage}.
+              - "keyDecisions" list of key decisions made, written in ${outputLanguage}.
+              - "discussionPoints" array of objects with "topic" and "summary" in ${outputLanguage}.
+              - "actionItems" array of objects with "task", "owner", and "priority" ("High" | "Medium" | "Low") in ${outputLanguage}.
+              - "fullTranscript" can be the cleaned/paragraph-formatted transcript of the original text.
+            `;
+          }
+
+          contents.push({ text: promptText });
+
+          const systemInstruction = `You are an expert multilingual executive secretary and professional meeting stenographer. 
+          You understand French, Algerian Darija (الدارجة الجزائرية), Standard Arabic (الفصحى), and English perfectly. 
+          Your role is to transcribe audio recordings and summarize meetings clearly.
+          Even if speakers switch languages, you will provide the overall summary, key decisions, discussion points, and action items in the requested target language.
+          Your outputs must be strictly formatted as JSON without markdown wrappers, matching the specified fields.`;
+
+          const rawJsonText = await callGeminiDirectly({
+            contents,
+            systemInstruction,
+            responseMimeType: "application/json",
+          });
+
+          const sanitizedText = rawJsonText.replace(/```json/g, "").replace(/```/g, "").trim();
+          summaryResult = JSON.parse(sanitizedText);
+        } else {
+          throw err;
+        }
       }
-
-      const summaryResult: MeetingSummary = await response.json();
       
       // Inject details generated locally
       summaryResult.id = "summary-" + Date.now();
@@ -667,20 +917,49 @@ export default function App() {
     setErrorBanner(null);
 
     try {
-      const response = await fetch("/api/translate", {
-        method: "POST",
-        headers: getHeaders(),
-        body: JSON.stringify({
-          summaryData: currentSummary,
-          targetLanguage: targetLang,
-        }),
-      });
+      let translatedSummary: MeetingSummary;
+      try {
+        const response = await fetch("/api/translate", {
+          method: "POST",
+          headers: getHeaders(),
+          body: JSON.stringify({
+            summaryData: currentSummary,
+            targetLanguage: targetLang,
+          }),
+        });
 
-      if (!response.ok) {
-        throw new Error("La traduction à la volée a échoué.");
+        if (!response.ok) {
+          throw new Error("La traduction à la volée a échoué.");
+        }
+
+        translatedSummary = await response.json();
+      } catch (err: any) {
+        // Fallback to client-side direct call
+        const savedKey = localStorage.getItem("custom_gemini_api_key");
+        if (savedKey) {
+          console.log("Server translation failed or unreachable. Falling back to direct client-side call...", err);
+          
+          const promptText = `
+            You are a translation assistant. Translate the following meeting analysis JSON structure fully into ${targetLang}.
+            Keep keys exactly as they are. Keep names, acronyms, and professional tech vocabulary intact, but render descriptions, topics, summaries, and tasks naturally in ${targetLang}.
+            Ensure Arabic/Darija or special terms are properly explained/translated if they are in discussion items.
+
+            JSON structure to translate:
+            ${JSON.stringify(currentSummary, null, 2)}
+          `;
+
+          const rawJsonText = await callGeminiDirectly({
+            contents: [{ text: promptText }],
+            systemInstruction: "You strictly output JSON translating content into the requested language.",
+            responseMimeType: "application/json",
+          });
+
+          const sanitizedText = rawJsonText.replace(/```json/g, "").replace(/```/g, "").trim();
+          translatedSummary = JSON.parse(sanitizedText);
+        } else {
+          throw err;
+        }
       }
-
-      const translatedSummary: MeetingSummary = await response.json();
 
       // Keep original metadata
       translatedSummary.id = currentSummary.id;
@@ -699,7 +978,7 @@ export default function App() {
 
     } catch (err: any) {
       console.error("Translation fail", err);
-      setErrorBanner("La traduction instantanée a échoué. Veuillez vérifier la connexion au serveur.");
+      setErrorBanner("La traduction instantanée a échoué. Veuillez vérifier la connexion au serveur ou votre clé d'API Google Gemini.");
     } finally {
       setIsTranslating(false);
     }
@@ -713,22 +992,70 @@ export default function App() {
     setErrorBanner(null);
 
     try {
-      const response = await fetch("/api/summarize", {
-        method: "POST",
-        headers: getHeaders(),
-        body: JSON.stringify({
-          manualTranscript: correctedTranscript,
-          outputLanguage: currentSummary.targetLanguage,
-          contextNotes: contextNotes || "Correction manuelle de la transcription par l'utilisateur",
-        }),
-      });
+      let summaryResult: MeetingSummary;
+      try {
+        const response = await fetch("/api/summarize", {
+          method: "POST",
+          headers: getHeaders(),
+          body: JSON.stringify({
+            manualTranscript: correctedTranscript,
+            outputLanguage: currentSummary.targetLanguage,
+            contextNotes: contextNotes || "Correction manuelle de la transcription par l'utilisateur",
+          }),
+        });
 
-      if (!response.ok) {
-        const errData = await response.json();
-        throw new Error(errData.error || "La régénération a échoué.");
+        if (!response.ok) {
+          const errData = await response.json().catch(() => ({}));
+          throw new Error(errData.error || "La régénération a échoué.");
+        }
+
+        summaryResult = await response.json();
+      } catch (err: any) {
+        // Fallback to client-side direct call
+        const savedKey = localStorage.getItem("custom_gemini_api_key");
+        if (savedKey) {
+          console.log("Server re-analysis failed or unreachable. Falling back to direct client-side call...", err);
+          
+          const promptText = `
+            Analyze the following meeting transcript text. 
+            The transcript might be in French, Arabic, Algerian Darija, English, or mixed.
+            
+            Transcript:
+            """
+            ${correctedTranscript}
+            """
+
+            Context notes provided by user (if any): "${contextNotes || "Correction manuelle de la transcription par l'utilisateur"}"
+
+            Analyze this text and generate a professional, highly structured summary and analysis.
+            Generate the output strictly following the JSON format schema below:
+            - The "title" should be a suitable summary name for the meeting in ${currentSummary.targetLanguage}.
+            - "languagesFound" must be list of languages detected (e.g. ["Darija", "French", "English", "Arabic"]).
+            - "overallSummary" of the meeting, written in ${currentSummary.targetLanguage}.
+            - "keyDecisions" list of key decisions made, written in ${currentSummary.targetLanguage}.
+            - "discussionPoints" array of objects with "topic" and "summary" in ${currentSummary.targetLanguage}.
+            - "actionItems" array of objects with "task", "owner", and "priority" ("High" | "Medium" | "Low") in ${currentSummary.targetLanguage}.
+            - "fullTranscript" can be the cleaned/paragraph-formatted transcript of the original text.
+          `;
+
+          const systemInstruction = `You are an expert multilingual executive secretary and professional meeting stenographer. 
+          You understand French, Algerian Darija (الدارجة الجزائرية), Standard Arabic (الفصحى), and English perfectly. 
+          Your role is to transcribe audio recordings and summarize meetings clearly.
+          Even if speakers switch languages, you will provide the overall summary, key decisions, discussion points, and action items in the requested target language.
+          Your outputs must be strictly formatted as JSON without markdown wrappers, matching the specified fields.`;
+
+          const rawJsonText = await callGeminiDirectly({
+            contents: [{ text: promptText }],
+            systemInstruction,
+            responseMimeType: "application/json",
+          });
+
+          const sanitizedText = rawJsonText.replace(/```json/g, "").replace(/```/g, "").trim();
+          summaryResult = JSON.parse(sanitizedText);
+        } else {
+          throw err;
+        }
       }
-
-      const summaryResult: MeetingSummary = await response.json();
       
       // Preserve tracking info and dates
       summaryResult.id = currentSummary.id;
@@ -751,7 +1078,7 @@ export default function App() {
       console.error("Failed to re-analyze from corrected transcript", err);
       setErrorBanner(
         err.message || 
-        "Impossible de régénérer le compte-rendu. Veuillez vérifier la connexion au serveur Gemini."
+        "Impossible de régénérer le compte-rendu. Veuillez vérifier votre connexion ou votre clé d'API."
       );
     } finally {
       setIsReAnalyzing(false);
@@ -838,14 +1165,14 @@ export default function App() {
       <main className="flex-1 max-w-7xl w-full mx-auto p-4 sm:p-6 lg:p-8 flex flex-col gap-6">
         
         {/* API Warning banner */}
-        {isServerHealthy === false && (
+        {isServerHealthy === false && !customApiKey && (
           <div className="bg-amber-50 rounded-xl border border-amber-200 p-4 flex gap-3 text-amber-900 text-sm">
             <AlertCircle className="w-5 h-5 text-amber-600 flex-shrink-0 mt-0.5" />
             <div>
               <h4 className="font-semibold text-amber-900">Variables d'environnement non configurées</h4>
               <p className="text-xs text-amber-800 mt-1 leading-relaxed">
                 Le serveur s'est lancé correctement mais n'a pas détecté la clé secrète <code className="font-mono bg-amber-100 px-1 py-0.5 rounded">GEMINI_API_KEY</code>.
-                Pour activer le service, configurez votre clé d'API Google dans le panneau <strong>Settings &gt; Secrets</strong> de Google AI Studio, puis rechargez l'application.
+                Pour activer le service, configurez votre clé d'API Google dans le panneau <strong>Settings &gt; Secrets</strong> de Google AI Studio, ou saisissez simplement votre propre clé d'API personnelle dans le champ <strong>Clé d'API Google Gemini</strong> ci-dessous. Elle sera sauvegardée localement dans votre navigateur.
               </p>
             </div>
           </div>
