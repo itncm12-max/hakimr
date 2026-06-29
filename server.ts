@@ -121,7 +121,7 @@ async function startServer() {
       const customKey = (req.headers["x-gemini-api-key"] || req.headers["x-api-key"] || req.query.customKey) as string;
       const ai = getGemini(customKey);
       // Validate key by listing models
-      await ai.models.list({ pageSize: 1 });
+      await ai.models.list();
       res.json({ status: "ok", apiKeyConfigured: true });
     } catch (err: any) {
       res.json({ status: "warn", apiKeyConfigured: false, message: err.message });
